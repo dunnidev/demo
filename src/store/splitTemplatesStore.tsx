@@ -1,4 +1,10 @@
 import { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import {
+  isBoundedString,
+  isFiniteTimestamp,
+  readVersionedCollection,
+  writeVersioned,
+} from '../lib/versionedStorage';
 
 export interface TemplateRow {
   metaAddress: string;
@@ -56,9 +62,10 @@ function isValidTemplateRow(value: unknown): value is TemplateRow {
   if (typeof value !== 'object' || value === null) return false;
   const row = value as Record<string, unknown>;
   return (
-    typeof row.metaAddress === 'string' &&
-    typeof row.amountRaw === 'string' &&
-    (row.memo === undefined || typeof row.memo === 'string')
+    isBoundedString(row.metaAddress, 512) &&
+    row.metaAddress.length > 0 &&
+    isBoundedString(row.amountRaw, 128) &&
+    (row.memo === undefined || isBoundedString(row.memo, 256))
   );
 }
 
@@ -66,13 +73,14 @@ export function isValidTemplate(value: unknown): value is SplitTemplate {
   if (typeof value !== 'object' || value === null) return false;
   const t = value as Record<string, unknown>;
   return (
-    typeof t.id === 'string' &&
+    isBoundedString(t.id, 128) &&
     t.id.length > 0 &&
-    typeof t.name === 'string' &&
+    isBoundedString(t.name, 200) &&
     Array.isArray(t.rows) &&
+    t.rows.length <= 100 &&
     t.rows.every(isValidTemplateRow) &&
-    typeof t.createdAt === 'number' &&
-    typeof t.updatedAt === 'number'
+    isFiniteTimestamp(t.createdAt) &&
+    isFiniteTimestamp(t.updatedAt)
   );
 }
 
@@ -87,6 +95,15 @@ export function templatesEqual(a: SplitTemplate, b: SplitTemplate): boolean {
         (row.memo ?? '') === (b.rows[i].memo ?? ''),
     )
   );
+}
+
+export function extractTemplates(value: unknown) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === 'object' && value !== null) {
+    const envelope = value as { templates?: unknown };
+    return Array.isArray(envelope.templates) ? envelope.templates : undefined;
+  }
+  return undefined;
 }
 
 /**
@@ -159,22 +176,40 @@ export function resolveTemplateImport(
 export function SplitTemplatesProvider({ children }: { children: ReactNode }) {
   const [templates, setTemplates] = useState<SplitTemplate[]>([]);
 
-  // Load templates from localStorage on mount
+  // Load templates from localStorage on mount and sync across tabs
   useEffect(() => {
-    try {
-      const stored = localStorage.getItem(STORAGE_KEY);
-      if (stored) {
-        setTemplates(JSON.parse(stored));
+    const load = () => {
+      try {
+        setTemplates(
+          readVersionedCollection(localStorage, STORAGE_KEY, isValidTemplate, extractTemplates),
+        );
+      } catch {
+        // Ignore parse errors
       }
-    } catch {
-      // Ignore parse errors
-    }
-  }, []);
+    };
 
-  // Save templates to localStorage when they change
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(templates));
-  }, [templates]);
+    load();
+
+    const handleStorage = (e: StorageEvent) => {
+      if (e.key === STORAGE_KEY) {
+        if (e.newValue) {
+          try {
+            // Use the versioned reader when the storage event fires
+            setTemplates(
+              readVersionedCollection(localStorage, STORAGE_KEY, isValidTemplate, extractTemplates),
+            );
+          } catch {}
+        } else {
+          setTemplates([]);
+        }
+      } else if (e.key === null) {
+        setTemplates([]);
+      }
+    };
+
+    window.addEventListener('storage', handleStorage);
+    return () => window.removeEventListener('storage', handleStorage);
+  }, []);
 
   const saveTemplate = (name: string, rows: TemplateRow[]) => {
     const now = Date.now();
@@ -185,24 +220,73 @@ export function SplitTemplatesProvider({ children }: { children: ReactNode }) {
       createdAt: now,
       updatedAt: now,
     };
-    setTemplates((prev) => [...prev, newTemplate]);
+    setTemplates((prev: SplitTemplate[]) => {
+      let currentStore = prev;
+      try {
+        currentStore = readVersionedCollection(
+          localStorage,
+          STORAGE_KEY,
+          isValidTemplate,
+          extractTemplates,
+        );
+      } catch {}
+      const next = [...currentStore, newTemplate];
+      writeVersioned(localStorage, STORAGE_KEY, next);
+      return next;
+    });
     return newTemplate;
   };
 
   const renameTemplate = (id: string, name: string) => {
-    setTemplates((prev) =>
-      prev.map((t) => (t.id === id ? { ...t, name, updatedAt: Date.now() } : t)),
-    );
+    setTemplates((prev: SplitTemplate[]) => {
+      let currentStore = prev;
+      try {
+        currentStore = readVersionedCollection(
+          localStorage,
+          STORAGE_KEY,
+          isValidTemplate,
+          extractTemplates,
+        );
+      } catch {}
+      const next = currentStore.map((t) =>
+        t.id === id ? { ...t, name, updatedAt: Date.now() } : t,
+      );
+      writeVersioned(localStorage, STORAGE_KEY, next);
+      return next;
+    });
   };
 
   const deleteTemplate = (id: string) => {
-    setTemplates((prev) => prev.filter((t) => t.id !== id));
+    setTemplates((prev: SplitTemplate[]) => {
+      let currentStore = prev;
+      try {
+        currentStore = readVersionedCollection(
+          localStorage,
+          STORAGE_KEY,
+          isValidTemplate,
+          extractTemplates,
+        );
+      } catch {}
+      const next = currentStore.filter((t) => t.id !== id);
+      writeVersioned(localStorage, STORAGE_KEY, next);
+      return next;
+    });
   };
 
   const duplicateTemplate = (id: string) => {
-    setTemplates((prev) => {
-      const original = prev.find((t) => t.id === id);
-      if (!original) return prev;
+    setTemplates((prev: SplitTemplate[]) => {
+      let currentStore = prev;
+      try {
+        currentStore = readVersionedCollection(
+          localStorage,
+          STORAGE_KEY,
+          isValidTemplate,
+          extractTemplates,
+        );
+      } catch {}
+
+      const original = currentStore.find((t) => t.id === id);
+      if (!original) return currentStore;
       const now = Date.now();
       const copy: SplitTemplate = {
         ...original,
@@ -211,7 +295,9 @@ export function SplitTemplatesProvider({ children }: { children: ReactNode }) {
         createdAt: now,
         updatedAt: now,
       };
-      return [...prev, copy];
+      const next = [...currentStore, copy];
+      writeVersioned(localStorage, STORAGE_KEY, next);
+      return next;
     });
   };
 
@@ -230,6 +316,7 @@ export function SplitTemplatesProvider({ children }: { children: ReactNode }) {
     // Throws on invalid JSON / shape (see resolveTemplateImport) so the
     // caller can show a real error instead of a silent no-op.
     const result = resolveTemplateImport(templates, json, overwriteConflicts);
+    writeVersioned(localStorage, STORAGE_KEY, result.next);
     setTemplates(result.next);
     return { imported: result.imported, skipped: result.skipped, conflicts: result.conflicts };
   };
